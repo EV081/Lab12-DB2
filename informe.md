@@ -214,6 +214,104 @@ De esta manera, se logra una fragmentación horizontal dinámica, ya que el sist
 
 ![alt text](./img/image14.png)
 
+### Investigación: uso de triggers en tablas particionadas
+
+PostgreSQL permite definir triggers sobre tablas particionadas. Cuando se crea un trigger por fila en la tabla padre, PostgreSQL genera triggers equivalentes en las particiones existentes y también en las particiones que se creen posteriormente.
+
+Sin embargo, para este problema no se empleó un trigger como mecanismo principal de creación dinámica de particiones, porque al insertar una fila en una tabla particionada PostgreSQL debe determinar primero la partición destino según el valor de la clave de partición. Si no existe una partición compatible con dicho valor, la inserción produce un error.
+
+Los triggers podrían utilizarse para tareas complementarias, como auditoría, validación de valores o registro de eventos. Sin embargo, en este laboratorio se utilizó un procedimiento almacenado porque permite verificar explícitamente la existencia de la partición antes de ejecutar el `INSERT`.
+
+El procedimiento `insertar_atencion_dinamica` construye el nombre de la partición, verifica su existencia mediante `to_regclass`, la crea dinámicamente con `CREATE TABLE ... PARTITION OF` cuando es necesario y finalmente inserta el registro en la tabla padre. De esta manera, al momento de la inserción PostgreSQL ya dispone de una partición válida para enrutar la atención médica.
+
+#### Prueba de comportamiento de un trigger en una tabla particionada
+
+Para evidenciar este comportamiento, se creó un esquema de prueba independiente, una tabla particionada con una única partición para el diagnóstico `Diabetes`, una tabla de auditoría y un trigger `BEFORE INSERT`.
+
+```postgres
+CREATE SCHEMA IF NOT EXISTS prueba_trigger;
+
+CREATE TABLE prueba_trigger.log_trigger (
+    id SERIAL PRIMARY KEY,
+    diagnostico VARCHAR(50),
+    mensaje TEXT,
+    fecha TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE prueba_trigger.atencion_demo (
+    dni CHAR(8),
+    diagnostico VARCHAR(50) NOT NULL
+) PARTITION BY LIST (diagnostico);
+
+CREATE TABLE prueba_trigger.atencion_demo_diabetes
+PARTITION OF prueba_trigger.atencion_demo
+FOR VALUES IN ('Diabetes');
+
+CREATE OR REPLACE FUNCTION prueba_trigger.registrar_trigger()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    INSERT INTO prueba_trigger.log_trigger (
+        diagnostico,
+        mensaje
+    )
+    VALUES (
+        NEW.diagnostico,
+        'El trigger BEFORE INSERT fue ejecutado'
+    );
+
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_before_insert_demo
+BEFORE INSERT ON prueba_trigger.atencion_demo
+FOR EACH ROW
+EXECUTE FUNCTION prueba_trigger.registrar_trigger();
+```
+
+Primero, se insertó un registro con diagnóstico `Diabetes`, para el cual sí existe una partición compatible. Posteriormente, se consultó la tabla de auditoría.
+
+```postgres
+INSERT INTO prueba_trigger.atencion_demo
+VALUES ('00000001', 'Diabetes');
+
+SELECT *
+FROM prueba_trigger.log_trigger;
+```
+
+![alt text](./img/image23.png)
+
+El resultado muestra que el trigger fue ejecutado correctamente, ya que se registró una fila de auditoría para el diagnóstico `Diabetes`. Esto ocurre porque PostgreSQL encontró la partición `atencion_demo_diabetes` y pudo enrutar el registro antes de realizar la inserción.
+
+Luego, se vació la tabla de auditoría y se intentó insertar un diagnóstico que no posee una partición asociada.
+
+```postgres
+TRUNCATE TABLE prueba_trigger.log_trigger;
+
+INSERT INTO prueba_trigger.atencion_demo
+VALUES ('00000002', 'Asma');
+```
+
+![alt text](./img/image24.png)
+
+La inserción produjo el error `no partition of relation "atencion_demo" found for row`. El mensaje indica que el valor `Asma` no cuenta con una partición compatible, por lo que PostgreSQL no puede enrutar el registro hacia una tabla física.
+
+Finalmente, se verificó el contenido de la tabla de auditoría después del intento fallido.
+
+```postgres
+SELECT *
+FROM prueba_trigger.log_trigger;
+```
+
+![alt text](./img/image25.png)
+
+La consulta no devuelve filas, lo cual evidencia que el intento de inserción con `Asma` no llegó a registrar la ejecución del trigger. Por tanto, aunque los triggers pueden utilizarse en tablas particionadas, no constituyen una solución directa para crear una nueva partición cuando todavía no existe un destino válido para la fila.
+
+Por esta razón, el procedimiento `insertar_atencion_dinamica` resulta más adecuado para el laboratorio: primero verifica y crea la partición necesaria, y luego inserta el registro en la tabla padre.
+
+
 ## P3. Asignación distribuida
 
 Para implementar la distribución de fragmentos se creó una red Docker exclusiva denominada `lab12-net`. En esta red se desplegaron tres instancias PostgreSQL: un servidor coordinador denominado `lab12-master` y dos servidores remotos, `lab12-worker1` y `lab12-worker2`.
