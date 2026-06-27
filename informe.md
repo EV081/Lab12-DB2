@@ -1172,4 +1172,293 @@ SELECT * FROM p_reduced NATURAL JOIN AtencionMedica;
   - Los tiempos de Q2 y Q3 son sub-milisegundo porque las temp tables intermedias son       
   diminutas (18 y 4 filas respectivamente).
 
-  
+## P5. Algoritmos distribuidos en tres servidores
+
+En esta sección se replican las cuatro consultas distribuidas de P4, pero ahora los fragmentos residen físicamente en tres contenedores Docker independientes. La comunicación entre el servidor coordinador y los workers se implementa con la extensión `postgres_fdw`.
+
+### Arquitectura
+
+| Servidor | Contenedor | Puerto | Fragmentos alojados |
+|----------|------------|--------|---------------------|
+| Master (coordinador) | `pg_master` | 5432 | `AtencionMedica_Diabetes`, `Pacientes_F1` |
+| Worker 1 | `pg_worker1` | 5433 | `AtencionMedica_Obesidad`, `AtencionMedica_Cardiopatia`, `Pacientes_F2` |
+| Worker 2 | `pg_worker2` | 5434 | `AtencionMedica_Hipertension`, `Pacientes_F3` |
+
+La fragmentación de `Pacientes` respeta el vector `["H","P"]`:
+- **F1** (Master): `CiudadOrigen < 'H'` → Arequipa, Ayacucho, Callao, Chiclayo, Chimbote, Cusco
+- **F2** (Worker1): `'H' ≤ CiudadOrigen < 'P'` → Huancayo, Huaraz, Ica, Iquitos, Juliaca, Lima, Moquegua
+- **F3** (Worker2): `CiudadOrigen ≥ 'P'` → Piura, Pucallpa, Tacna, Trujillo, Tumbes
+
+### Entorno Docker y configuración FDW
+
+Los tres contenedores se levantan con `docker compose up -d` usando la red compartida `pg_net`. En el master se instala `postgres_fdw`, se registran los workers como servidores foráneos y se crean las foreign tables que apuntan a las tablas físicas de cada worker:
+
+```yaml
+services:
+  pg_master:
+    image: postgres:16
+    container_name: pg_master
+    environment:
+      POSTGRES_PASSWORD: pass
+    ports:
+      - "5432:5432"
+    networks:
+      - pg_net
+  pg_worker1:
+    image: postgres:16
+    container_name: pg_worker1
+    environment:
+      POSTGRES_PASSWORD: pass
+    ports:
+      - "5433:5432"
+    networks:
+      - pg_net
+  pg_worker2:
+    image: postgres:16
+    container_name: pg_worker2
+    environment:
+      POSTGRES_PASSWORD: pass
+    ports:
+      - "5434:5432"
+    networks:
+      - pg_net
+networks:
+  pg_net:
+    driver: bridge
+```
+
+Desde el master se registran los workers y se crean los mapeos de usuario:
+
+``` postgres
+CREATE EXTENSION IF NOT EXISTS postgres_fdw;
+
+CREATE SERVER worker1
+    FOREIGN DATA WRAPPER postgres_fdw
+    OPTIONS (host 'pg_worker1', port '5432', dbname 'postgres');
+
+CREATE SERVER worker2
+    FOREIGN DATA WRAPPER postgres_fdw
+    OPTIONS (host 'pg_worker2', port '5432', dbname 'postgres');
+
+CREATE USER MAPPING FOR postgres SERVER worker1
+    OPTIONS (user 'postgres', password 'pass');
+
+CREATE USER MAPPING FOR postgres SERVER worker2
+    OPTIONS (user 'postgres', password 'pass');
+```
+
+Las foreign tables en el master mapean directamente a las tablas físicas de los workers:
+
+``` postgres
+CREATE FOREIGN TABLE AtencionMedica_Obesidad_fdw (
+    DNI CHAR(8), CodMedico INTEGER, Ciudad VARCHAR(50),
+    Diagnostico VARCHAR(50), Peso DECIMAL(5,2), Talla DECIMAL(4,2),
+    PresionArterial VARCHAR(10), Edad INTEGER, FechaAtencion DATE
+) SERVER worker1 OPTIONS (table_name 'atencionmedica_obesidad');
+
+CREATE FOREIGN TABLE AtencionMedica_Cardiopatia_fdw (
+    DNI CHAR(8), CodMedico INTEGER, Ciudad VARCHAR(50),
+    Diagnostico VARCHAR(50), Peso DECIMAL(5,2), Talla DECIMAL(4,2),
+    PresionArterial VARCHAR(10), Edad INTEGER, FechaAtencion DATE
+) SERVER worker1 OPTIONS (table_name 'atencionmedica_cardiopatia');
+
+CREATE FOREIGN TABLE AtencionMedica_Hipertension_fdw (
+    DNI CHAR(8), CodMedico INTEGER, Ciudad VARCHAR(50),
+    Diagnostico VARCHAR(50), Peso DECIMAL(5,2), Talla DECIMAL(4,2),
+    PresionArterial VARCHAR(10), Edad INTEGER, FechaAtencion DATE
+) SERVER worker2 OPTIONS (table_name 'atencionmedica_hipertension');
+
+CREATE FOREIGN TABLE Pacientes_F2_fdw (
+    DNI CHAR(8), Nombre VARCHAR(50), Apellidos VARCHAR(100),
+    FechaNacimiento DATE, Sexo CHAR(1), CiudadOrigen VARCHAR(50)
+) SERVER worker1 OPTIONS (table_name 'pacientes_f2');
+
+CREATE FOREIGN TABLE Pacientes_F3_fdw (
+    DNI CHAR(8), Nombre VARCHAR(50), Apellidos VARCHAR(100),
+    FechaNacimiento DATE, Sexo CHAR(1), CiudadOrigen VARCHAR(50)
+) SERVER worker2 OPTIONS (table_name 'pacientes_f3');
+```
+
+### Q1. SELECT * FROM Pacientes ORDER BY FechaNacimiento
+
+Cada fragmento se materializa en una tabla temporal ordenada por `FechaNacimiento`. El fragmento F1 es local en el master; F2 y F3 se obtienen mediante FDW desde los workers. El merge final se ejecuta en el coordinador.
+
+``` postgres
+CREATE TEMP TABLE r1 ON COMMIT DROP AS
+    SELECT * FROM Pacientes_F1 ORDER BY FechaNacimiento;
+
+CREATE TEMP TABLE r2 ON COMMIT DROP AS
+    SELECT * FROM Pacientes_F2_fdw ORDER BY FechaNacimiento;
+
+CREATE TEMP TABLE r3 ON COMMIT DROP AS
+    SELECT * FROM Pacientes_F3_fdw ORDER BY FechaNacimiento;
+
+EXPLAIN ANALYZE
+SELECT * FROM (
+    SELECT * FROM r1
+    UNION ALL SELECT * FROM r2
+    UNION ALL SELECT * FROM r3
+) m
+ORDER BY FechaNacimiento;
+```
+
+![alt text](./p5/img/q1.png)
+
+### Q2. SELECT DISTINCT CiudadOrigen FROM Pacientes
+
+Cada worker aplica `DISTINCT` localmente sobre su fragmento. El master recibe únicamente las ciudades únicas de cada fragmento y las concatena con `UNION ALL`, sin necesidad de re-deduplicar porque la fragmentación por `CiudadOrigen` garantiza que cada ciudad vive en un solo fragmento.
+
+``` postgres
+CREATE TEMP TABLE r1 ON COMMIT DROP AS
+    SELECT DISTINCT CiudadOrigen FROM Pacientes_F1;
+
+CREATE TEMP TABLE r2 ON COMMIT DROP AS
+    SELECT DISTINCT CiudadOrigen FROM Pacientes_F2_fdw;
+
+CREATE TEMP TABLE r3 ON COMMIT DROP AS
+    SELECT DISTINCT CiudadOrigen FROM Pacientes_F3_fdw;
+
+EXPLAIN ANALYZE
+SELECT CiudadOrigen FROM r1
+UNION ALL SELECT CiudadOrigen FROM r2
+UNION ALL SELECT CiudadOrigen FROM r3;
+```
+
+![alt text](./p5/img/q2.png)
+
+### Q3. SELECT Diagnostico, AVG(Edad) AS PromEdad FROM AtencionMedica GROUP BY Diagnostico
+
+Cada fragmento calcula su propio `AVG(Edad)` de forma local (uno por diagnóstico). El master recibe exactamente una fila por fragmento y las concatena con `UNION ALL`. No es necesaria una re-agregación porque cada fragmento almacena un único valor de `Diagnostico`.
+
+``` postgres
+CREATE TEMP TABLE r1 ON COMMIT DROP AS
+    SELECT Diagnostico, AVG(Edad) AS PromEdad
+    FROM AtencionMedica_Diabetes GROUP BY Diagnostico;
+
+CREATE TEMP TABLE r2 ON COMMIT DROP AS
+    SELECT Diagnostico, AVG(Edad) AS PromEdad
+    FROM AtencionMedica_Obesidad_fdw GROUP BY Diagnostico;
+
+CREATE TEMP TABLE r3 ON COMMIT DROP AS
+    SELECT Diagnostico, AVG(Edad) AS PromEdad
+    FROM AtencionMedica_Cardiopatia_fdw GROUP BY Diagnostico;
+
+CREATE TEMP TABLE r4 ON COMMIT DROP AS
+    SELECT Diagnostico, AVG(Edad) AS PromEdad
+    FROM AtencionMedica_Hipertension_fdw GROUP BY Diagnostico;
+
+EXPLAIN ANALYZE
+SELECT * FROM r1
+UNION ALL SELECT * FROM r2
+UNION ALL SELECT * FROM r3
+UNION ALL SELECT * FROM r4;
+```
+
+![alt text](./p5/img/q3.png)
+
+### Q4. SELECT * FROM Pacientes NATURAL JOIN AtencionMedica
+
+Se aplica el algoritmo de semi-join distribuido en cinco fases. Primero se proyectan los DNIs presentes en cada fragmento de `AtencionMedica` (incluyendo los workers vía FDW). Luego se construye el conjunto unificado de DNIs y se filtra cada fragmento de `Pacientes` antes de enviarlo al master. Finalmente el coordinador ejecuta el join sobre los datos ya reducidos.
+
+``` postgres
+-- Fase 1: proyección local de DNI en cada fragmento de AtencionMedica
+CREATE TEMP TABLE dni_a1 ON COMMIT DROP AS
+    SELECT DISTINCT DNI FROM AtencionMedica_Diabetes;
+
+CREATE TEMP TABLE dni_a2 ON COMMIT DROP AS
+    SELECT DISTINCT DNI FROM AtencionMedica_Obesidad_fdw;
+
+CREATE TEMP TABLE dni_a3 ON COMMIT DROP AS
+    SELECT DISTINCT DNI FROM AtencionMedica_Cardiopatia_fdw;
+
+CREATE TEMP TABLE dni_a4 ON COMMIT DROP AS
+    SELECT DISTINCT DNI FROM AtencionMedica_Hipertension_fdw;
+
+-- Fase 2: unión deduplicada de DNIs en el coordinador
+CREATE TEMP TABLE dni_atencion ON COMMIT DROP AS
+    SELECT DNI FROM dni_a1
+    UNION SELECT DNI FROM dni_a2
+    UNION SELECT DNI FROM dni_a3
+    UNION SELECT DNI FROM dni_a4;
+
+-- Fase 3: semi-join en cada fragmento de Pacientes
+CREATE TEMP TABLE p_filt_1 ON COMMIT DROP AS
+    SELECT * FROM Pacientes_F1
+    WHERE DNI IN (SELECT DNI FROM dni_atencion);
+
+CREATE TEMP TABLE p_filt_2 ON COMMIT DROP AS
+    SELECT * FROM Pacientes_F2_fdw
+    WHERE DNI IN (SELECT DNI FROM dni_atencion);
+
+CREATE TEMP TABLE p_filt_3 ON COMMIT DROP AS
+    SELECT * FROM Pacientes_F3_fdw
+    WHERE DNI IN (SELECT DNI FROM dni_atencion);
+
+-- Fase 4: reunir el lado izquierdo reducido en el coordinador
+CREATE TEMP TABLE p_reduced ON COMMIT DROP AS
+    SELECT * FROM p_filt_1
+    UNION ALL SELECT * FROM p_filt_2
+    UNION ALL SELECT * FROM p_filt_3;
+
+-- Fase 5: consolidar AtencionMedica completa y ejecutar el join final
+CREATE TEMP TABLE atencion_completa ON COMMIT DROP AS
+    SELECT * FROM AtencionMedica_Diabetes
+    UNION ALL SELECT * FROM AtencionMedica_Obesidad_fdw
+    UNION ALL SELECT * FROM AtencionMedica_Cardiopatia_fdw
+    UNION ALL SELECT * FROM AtencionMedica_Hipertension_fdw;
+
+EXPLAIN ANALYZE
+SELECT * FROM p_reduced JOIN atencion_completa USING (DNI);
+```
+
+![alt text](./p5/img/q4.png)
+
+## Explicación de Resultados P5
+
+### Q1 — `SELECT * FROM Pacientes ORDER BY FechaNacimiento`
+
+**Plan**:
+- `Append` recorre las tres temp tables (`r1`, `r2`, `r3`), cada una con **20 000 filas** = **60 000 filas totales**. Los fragmentos resultaron balanceados porque la distribución de ciudades entre los tres rangos fue equitativa.
+- El coordinador aplica un `Sort` final con **`Sort Method: external merge`** (`Disk: 2864 kB`), equivalente al k-way merge del algoritmo distribuido.
+- **Execution Time = 33.309 ms**, significativamente mayor que los 14.18 ms de P4, porque la construcción de `r2` y `r3` implicó transferir 20 000 filas cada una desde los workers a través de la red Docker antes de que el EXPLAIN pudiera ejecutarse.
+
+### Q2 — `SELECT DISTINCT CiudadOrigen FROM Pacientes`
+
+**Plan**:
+- `Append` sobre `r1` (**6 filas**), `r2` (**7 filas**), `r3` (**5 filas**) = **18 ciudades distintas**, idéntico resultado al de P4.
+- `Seq Scan` simple en cada temp table; no se requiere re-deduplicación porque la partición por `CiudadOrigen` garantiza que cada ciudad existe en un único fragmento.
+- **Execution Time = 0.020 ms**. Ligeramente superior a los 0.012 ms de P4 por la latencia de red durante la construcción de las tablas temporales, pero igualmente sub-milisegundo para el EXPLAIN final.
+
+### Q3 — `SELECT Diagnostico, AVG(Edad) GROUP BY Diagnostico`
+
+**Plan**:
+- `Append` sobre `r1`, `r2`, `r3`, `r4`, cada una con **exactamente 1 fila** = **4 filas finales**.
+- Cada fragmento calculó su `AVG(Edad)` de forma local antes de ser materializado en la temp table, por lo que el coordinador solo recibe resultados ya agregados.
+- **Execution Time = 0.019 ms**. Prácticamente idéntico a los 0.011 ms de P4 porque las temp tables intermedias son mínimas; la diferencia de red se absorbe en el overhead de construcción previo al EXPLAIN.
+
+### Q4 — `SELECT * FROM Pacientes NATURAL JOIN AtencionMedica`
+
+**Plan**:
+- El planificador eligió **`Merge Join`** en lugar del Hash Join de P4, ordenando ambas entradas por `DNI`.
+- `p_reduced` contiene **34 904 filas** (pacientes filtrados por semi-join), ordenadas con **quicksort en memoria** (3 336 kB).
+- `atencion_completa` contiene **60 000 filas**, ordenadas con **`Sort Method: external merge`** (`Disk: 4 232 kB`), lo que indica que el volumen supera la memoria de trabajo disponible.
+- **Execution Time = 298.815 ms**, muy superior a P4 porque la construcción de `atencion_completa` requirió transferir los 15 000 registros de cada fragmento remoto (Obesidad, Cardiopatía, Hipertensión) a través de la red antes del join final.
+
+### Diferencia clave respecto a P4
+
+| Aspecto | P4 (local) | P5 (distribuido) |
+|---------|-----------|-----------------|
+| Fuente de los fragmentos | Particiones locales en un único servidor | Tablas físicas en tres contenedores Docker |
+| Mecanismo de acceso remoto | No aplica | `postgres_fdw` con foreign tables (`_fdw`) |
+| Visibilidad en EXPLAIN del nodo final | `Seq Scan` sobre particiones locales | `Seq Scan` sobre temp tables (el `Foreign Scan` ocurrió en `CREATE TEMP TABLE`) |
+| Q1 Execution Time | 14.18 ms | 33.309 ms |
+| Q2 Execution Time | 0.012 ms | 0.020 ms |
+| Q3 Execution Time | 0.011 ms | 0.019 ms |
+| Q4 Execution Time | (local, ms bajos) | 298.815 ms |
+
+### Conclusiones
+
+- **Q2 y Q3** siguen siendo los casos óptimos también en el escenario distribuido: la clave de la operación coincide con la clave de partición, por lo que cada worker entrega un resultado ya reducido al master.
+- **Q1** evidencia el costo de la red: los 20 000 registros de cada worker deben transferirse íntegramente al master antes del merge, lo que más que dobla el tiempo respecto a P4.
+- **Q4** es el caso más costoso en el escenario distribuido porque el semi-join, aunque reduce el volumen de `Pacientes`, no puede evitar que el coordinador consolide todos los 60 000 registros de `AtencionMedica` desde cuatro fuentes (una local y tres remotas) para ejecutar el join final.
+- Los planes EXPLAIN del merge final muestran `Seq Scan` sobre tablas temporales en lugar de `Foreign Scan`, porque el acceso FDW se produce durante la fase `CREATE TEMP TABLE`. Sin embargo, el overhead de red queda reflejado en los tiempos de ejecución globales superiores a los de P4.
