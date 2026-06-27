@@ -1,4 +1,4 @@
--- SECCIÓN A: ejecutar en pg_worker1
+-- worker1: tablas y datos
 -- docker exec -i pg_worker1 psql -U postgres
 
 CREATE TABLE IF NOT EXISTS AtencionMedica_Obesidad (
@@ -74,7 +74,7 @@ SELECT
 FROM generate_series(20001, 40000) g;
 
 
--- SECCIÓN B: ejecutar en pg_worker2
+-- worker2: tablas y datos
 -- docker exec -i pg_worker2 psql -U postgres
 
 CREATE TABLE IF NOT EXISTS AtencionMedica_Hipertension (
@@ -131,7 +131,7 @@ SELECT
 FROM generate_series(40001, 60000) g;
 
 
--- SECCIÓN C: ejecutar en pg_master
+-- master: tablas locales + fdw + foreign tables
 -- docker exec -i pg_master psql -U postgres
 
 CREATE TABLE IF NOT EXISTS AtencionMedica_Diabetes (
@@ -232,9 +232,9 @@ CREATE FOREIGN TABLE IF NOT EXISTS Pacientes_F3_fdw (
 ) SERVER worker2 OPTIONS (table_name 'pacientes_f3');
 
 
--- SECCIÓN D: queries distribuidas (ejecutar en pg_master)
+-- queries (master)
 
--- Q1. SELECT * FROM Pacientes ORDER BY FechaNacimiento
+-- Q1
 BEGIN;
 CREATE TEMP TABLE r1 ON COMMIT DROP AS
     SELECT * FROM Pacientes_F1 ORDER BY FechaNacimiento;
@@ -251,7 +251,7 @@ SELECT * FROM (
 COMMIT;
 
 
--- Q2. SELECT DISTINCT CiudadOrigen FROM Pacientes
+-- Q2
 BEGIN;
 CREATE TEMP TABLE r1 ON COMMIT DROP AS
     SELECT DISTINCT CiudadOrigen FROM Pacientes_F1;
@@ -266,7 +266,7 @@ UNION ALL SELECT CiudadOrigen FROM r3;
 COMMIT;
 
 
--- Q3. SELECT Diagnostico, AVG(Edad) AS PromEdad FROM AtencionMedica GROUP BY Diagnostico
+-- Q3
 BEGIN;
 CREATE TEMP TABLE r1 ON COMMIT DROP AS
     SELECT Diagnostico, AVG(Edad) AS PromEdad
@@ -288,7 +288,7 @@ UNION ALL SELECT * FROM r4;
 COMMIT;
 
 
--- Q4. SELECT * FROM Pacientes NATURAL JOIN AtencionMedica
+-- Q4
 BEGIN;
 CREATE TEMP TABLE dni_a1 ON COMMIT DROP AS
     SELECT DISTINCT DNI FROM AtencionMedica_Diabetes;
